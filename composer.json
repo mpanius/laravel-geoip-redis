@@ -1,0 +1,49 @@
+{
+    "name": "mpanius/laravel-geoip-redis",
+    "description": "Native Redis GeoIP lookup using Redis 7+ Functions (FCALL_RO) and Sorted Sets. Zero PHP-level parsing at request time.",
+    "keywords": ["laravel", "geoip", "redis", "ip-to-country", "fcall", "sorted-set"],
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Mikhail Panyushkin",
+            "email": "m@mpanius.dev"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "ext-redis": "*",
+        "illuminate/redis": "^11.0|^12.0",
+        "illuminate/support": "^11.0|^12.0",
+        "spatie/laravel-package-tools": "^1.93"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0",
+        "phpunit/phpunit": "^11.0|^12.0|^13.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Mpanius\\GeoIpRedis\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Mpanius\\GeoIpRedis\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Mpanius\\GeoIpRedis\\GeoIpRedisServiceProvider"
+            ],
+            "aliases": {
+                "GeoIpRedis": "Mpanius\\GeoIpRedis\\Facades\\GeoIpRedis"
+            }
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "config": {
+        "sort-packages": true
+    }
+}
