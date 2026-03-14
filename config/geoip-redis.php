@@ -7,7 +7,11 @@ return [
     |--------------------------------------------------------------------------
     |
     | Redis connection name from config/database.php.
-    | Рекомендуется выделенное соединение без сериализации (serializer=NONE).
+    |
+    | IMPORTANT: The connection MUST use serializer=NONE and compression=NONE.
+    | The Lua function parses Sorted Set members as plain strings ("CC:start_ip")
+    | via string.find(). Igbinary/PHP serialization or compression would turn
+    | members into binary data that Lua cannot parse.
     |
     */
     'connection' => env('GEOIP_REDIS_CONNECTION', 'default'),
