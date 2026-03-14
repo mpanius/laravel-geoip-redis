@@ -8,8 +8,18 @@ Native Redis GeoIP lookup для Laravel. Использует Redis 7+ Function
 
 - PHP 8.2+
 - Laravel 11/12
-- Redis 7+ (для `FUNCTION LOAD` / `FCALL_RO`)
-- ext-redis (phpredis)
+- **Redis 7+** (для `FUNCTION LOAD` / `FCALL_RO`)
+- **ext-redis** (phpredis) — Predis не поддерживается (нет нативного `fcall_ro()`)
+
+### Обязательные условия
+
+| Требование | Почему |
+|---|---|
+| **Redis 7+** | `FUNCTION LOAD` / `FCALL_RO` появились в Redis 7.0. Более ранние версии не поддерживают серверные функции. Проверьте: `redis-cli INFO server \| grep redis_version`. |
+| **phpredis** (не Predis) | Пакет использует `fcall_ro()`, `function()` и `pipeline()` — нативные методы phpredis. Predis их не предоставляет. |
+| **Выделенное Redis-соединение** | Обязательно `serializer=NONE` и `compression=NONE`. Подробности в разделе [Настройка](#настройка). |
+| **Trusted Proxies** | `request()->ip()` должен возвращать реальный IP клиента, а не адрес балансировщика или CDN. См. [Trusted Proxies](#trusted-proxies). |
+| **Сетевой доступ** | Сервер, на котором запускается `geoip:update`, должен иметь доступ к URL скачивания CSV. |
 
 ## Установка
 
@@ -145,6 +155,49 @@ ZRANGEBYSCORE geoip:v4 <ip_integer> +inf LIMIT 0 1
 - Обновляется ежедневно
 - Лицензия: CC BY-SA 4.0
 - Формат: `network,country,country_code,continent_code`
+
+## Trusted Proxies
+
+Чтобы `request()->ip()` возвращал реальный IP клиента (а не адрес балансировщика или CDN), **необходимо** настроить trusted proxies.
+
+В `bootstrap/app.php` (Laravel 11+):
+
+```php
+->withMiddleware(function (Middleware $middleware) {
+    // Доверять всем прокси (типично для приложений за известным LB/CDN)
+    $middleware->trustProxies(at: '*');
+
+    // Или доверять конкретным IP прокси
+    $middleware->trustProxies(at: [
+        '192.168.1.0/24',
+        '10.0.0.0/8',
+    ]);
+})
+```
+
+**Без этой настройки** `request()->ip()` вернёт IP прокси (например `10.0.0.1`), и GeoIP lookup определит неверную страну или вернёт `null`.
+
+Типичные сценарии:
+- **За nginx/HAProxy** — доверять IP внутренней сети
+- **За Cloudflare** — доверять [IP-диапазонам Cloudflare](https://www.cloudflare.com/ips/) или использовать `at: '*'`
+- **За AWS ALB/ELB** — использовать `at: '*'` (ALB передаёт `X-Forwarded-For`)
+
+> **Совет**: Если у вас уже есть GeoIP-заголовки от edge-слоя (nginx `geoip2` module → `GEOIP_COUNTRY_CODE`, Cloudflare → `CF-IPCountry`), можно использовать их напрямую, минуя lookup. Этот пакет идеален как fallback или standalone-решение, когда edge-level GeoIP недоступен.
+
+## Рекомендации
+
+- **Выделенная Redis DB**: Используйте отдельную базу Redis (например DB 3) для изоляции GeoIP данных от кеша приложения и сессий.
+- **Планировщик**: Запускайте `geoip:update` ежедневно через scheduler. Команда идемпотентна — пропускает скачивание, если настроенный интервал не истёк.
+- **Используйте как fallback**: В большинстве production-окружений edge-level GeoIP (nginx/Cloudflare) быстрее. Используйте этот пакет как fallback при отсутствии заголовков:
+  ```php
+  $country = request()->server('GEOIP_COUNTRY_CODE')
+      ?: request()->header('CF-IPCountry')
+      ?: GeoIpRedis::lookup(request()->ip())
+      ?: 'US';
+  ```
+- **Read replicas**: Lua function зарегистрирована с `flags = {'no-writes'}`, поэтому lookup через `FCALL_RO` работает на Redis read replicas — идеально для масштабирования чтения.
+- **Мониторинг памяти**: Проверяйте использование памяти Redis командой `geoip:update --status`. Данные только по IPv4 обычно занимают 50–100 MB.
+- **Проверка после деплоя**: После деплоя на новый сервер выполните `geoip:update --register-function`, чтобы убедиться что Lua function загружена (она сохраняется в RDB/AOF, но свежий экземпляр Redis её не содержит).
 
 ## Лицензия
 
