@@ -70,7 +70,7 @@ class GeoIpRedis
         try {
             // 2+3. Parse and load into temp key
             $tempKey = $this->config('key') . ':loading';
-            [$count, $skipped] = $this->loadCsvToRedis($csvPath, $tempKey);
+            [$count, $skippedIpv6, $skippedEmpty, $skippedInvalid] = $this->loadCsvToRedis($csvPath, $tempKey);
 
             if ($count === 0) {
                 $this->redis()->del($tempKey);
@@ -84,10 +84,13 @@ class GeoIpRedis
             $this->registerFunction();
 
             // 6. Save metadata
+            $totalSkipped = $skippedIpv6 + $skippedEmpty + $skippedInvalid;
             $this->redis()->hMSet($this->config('meta_key'), [
                 'updated_at' => (string) now()->timestamp,
                 'entries_count' => (string) $count,
-                'skipped_count' => (string) $skipped,
+                'skipped_ipv6' => (string) $skippedIpv6,
+                'skipped_empty' => (string) $skippedEmpty,
+                'skipped_invalid' => (string) $skippedInvalid,
                 'source' => $this->config('download_url'),
             ]);
         } finally {
@@ -99,7 +102,9 @@ class GeoIpRedis
         return new UpdateResult(
             entriesCount: $count,
             duration: $duration,
-            skippedCount: $skipped,
+            skippedIpv6: $skippedIpv6,
+            skippedEmpty: $skippedEmpty,
+            skippedInvalid: $skippedInvalid,
         );
     }
 
@@ -161,7 +166,7 @@ class GeoIpRedis
     /**
      * Get current GeoIP status and metadata.
      *
-     * @return array{updated_at: int|null, entries_count: int, skipped_count: int, source: string|null, memory_bytes: int}
+     * @return array{updated_at: int|null, entries_count: int, skipped_ipv6: int, skipped_empty: int, skipped_invalid: int, source: string|null, memory_bytes: int, sorted_set_card: int}
      */
     public function status(): array
     {
@@ -181,7 +186,9 @@ class GeoIpRedis
         return [
             'updated_at' => isset($meta['updated_at']) ? (int) $meta['updated_at'] : null,
             'entries_count' => isset($meta['entries_count']) ? (int) $meta['entries_count'] : 0,
-            'skipped_count' => isset($meta['skipped_count']) ? (int) $meta['skipped_count'] : 0,
+            'skipped_ipv6' => isset($meta['skipped_ipv6']) ? (int) $meta['skipped_ipv6'] : 0,
+            'skipped_empty' => isset($meta['skipped_empty']) ? (int) $meta['skipped_empty'] : 0,
+            'skipped_invalid' => isset($meta['skipped_invalid']) ? (int) $meta['skipped_invalid'] : 0,
             'source' => $meta['source'] ?? null,
             'memory_bytes' => $memoryBytes,
             'sorted_set_card' => (int) $redis->zCard($key),
@@ -191,7 +198,7 @@ class GeoIpRedis
     /**
      * Parse CSV and load entries into Redis Sorted Set via pipeline.
      *
-     * @return array{0: int, 1: int} [loaded_count, skipped_count]
+     * @return array{0: int, 1: int, 2: int, 3: int} [loaded, skipped_ipv6, skipped_empty, skipped_invalid]
      */
     protected function loadCsvToRedis(string $csvPath, string $key): array
     {
@@ -224,13 +231,15 @@ class GeoIpRedis
 
         $batch = [];
         $count = 0;
-        $skipped = 0;
+        $skippedIpv6 = 0;
+        $skippedEmpty = 0;
+        $skippedInvalid = 0;
         $batchSize = $this->config('pipeline_batch_size');
         $ipv6Enabled = $this->config('ipv6_enabled');
 
         while (($row = fgetcsv($handle)) !== false) {
             if (count($row) <= max($networkIdx, $countryCodeIdx)) {
-                $skipped++;
+                $skippedInvalid++;
                 continue;
             }
 
@@ -239,20 +248,20 @@ class GeoIpRedis
 
             // Skip empty country codes
             if ($countryCode === '' || $countryCode === null) {
-                $skipped++;
+                $skippedEmpty++;
                 continue;
             }
 
             // Skip IPv6 if disabled
             if (! $ipv6Enabled && str_contains($network, ':')) {
-                $skipped++;
+                $skippedIpv6++;
                 continue;
             }
 
             // CIDR → start/end IP integers
             [$startIp, $endIp] = CidrConverter::toRange($network);
             if ($startIp === null) {
-                $skipped++;
+                $skippedInvalid++;
                 continue;
             }
 
@@ -272,7 +281,7 @@ class GeoIpRedis
 
         fclose($handle);
 
-        return [$count, $skipped];
+        return [$count, $skippedIpv6, $skippedEmpty, $skippedInvalid];
     }
 
     /**

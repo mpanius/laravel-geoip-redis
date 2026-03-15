@@ -48,7 +48,17 @@ class GeoIpUpdateCommand extends Command
             return self::FAILURE;
         }
 
-        $this->info("Loaded {$result->entriesCount} entries in {$result->duration}s (skipped: {$result->skippedCount})");
+        $this->info("Loaded {$result->entriesCount} IPv4 entries in {$result->duration}s");
+
+        if ($result->skippedIpv6 > 0) {
+            $this->comment("  Skipped {$result->skippedIpv6} IPv6 entries (ipv6_enabled=false)");
+        }
+        if ($result->skippedEmpty > 0) {
+            $this->comment("  Skipped {$result->skippedEmpty} entries with empty country code");
+        }
+        if ($result->skippedInvalid > 0) {
+            $this->warn("  Skipped {$result->skippedInvalid} invalid/malformed entries");
+        }
 
         return self::SUCCESS;
     }
@@ -67,9 +77,11 @@ class GeoIpUpdateCommand extends Command
             ['Parameter', 'Value'],
             [
                 ['Last update', $updatedAt],
-                ['Entries (loaded)', number_format($status['entries_count'])],
-                ['Entries (in sorted set)', number_format($status['sorted_set_card'])],
-                ['Skipped', number_format($status['skipped_count'])],
+                ['IPv4 entries (loaded)', number_format($status['entries_count'])],
+                ['Sorted set cardinality', number_format($status['sorted_set_card'])],
+                ['Skipped: IPv6', number_format($status['skipped_ipv6'])],
+                ['Skipped: empty country', number_format($status['skipped_empty'])],
+                ['Skipped: invalid', number_format($status['skipped_invalid'])],
                 ['Memory usage', "{$memoryMb} MB"],
                 ['Source', $status['source'] ?? 'N/A'],
                 ['Needs update', $service->needsUpdate() ? 'YES' : 'no'],
