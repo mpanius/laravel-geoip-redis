@@ -203,8 +203,24 @@ class GeoIpRedis
             throw new RuntimeException("Cannot open CSV file: {$csvPath}");
         }
 
-        // Skip header row
-        fgetcsv($handle);
+        // Parse header to find column indices dynamically
+        // iplocate.io format: network,continent_code,country_code,country_name
+        $header = fgetcsv($handle);
+        if ($header === false) {
+            fclose($handle);
+            throw new RuntimeException('CSV file is empty or has no header row.');
+        }
+
+        $header = array_map('strtolower', array_map('trim', $header));
+        $networkIdx = array_search('network', $header, true);
+        $countryCodeIdx = array_search('country_code', $header, true);
+
+        if ($networkIdx === false || $countryCodeIdx === false) {
+            fclose($handle);
+            throw new RuntimeException(
+                'CSV header must contain "network" and "country_code" columns. Got: ' . implode(', ', $header),
+            );
+        }
 
         $batch = [];
         $count = 0;
@@ -213,13 +229,13 @@ class GeoIpRedis
         $ipv6Enabled = $this->config('ipv6_enabled');
 
         while (($row = fgetcsv($handle)) !== false) {
-            if (count($row) < 3) {
+            if (count($row) <= max($networkIdx, $countryCodeIdx)) {
                 $skipped++;
                 continue;
             }
 
-            $network = $row[0];
-            $countryCode = $row[2];
+            $network = $row[$networkIdx];
+            $countryCode = $row[$countryCodeIdx];
 
             // Skip empty country codes
             if ($countryCode === '' || $countryCode === null) {

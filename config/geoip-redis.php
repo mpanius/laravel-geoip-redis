@@ -32,9 +32,12 @@ return [
     | Download URL
     |--------------------------------------------------------------------------
     |
-    | URL для скачивания CSV базы ip-to-country.
-    | По умолчанию — iplocate.io (CC BY-SA 4.0, daily updates).
-    | Формат CSV: network,country,country_code,continent_code
+    | URL for downloading the ip-to-country database.
+    | Default: iplocate.io (CC BY-SA 4.0, daily updates).
+    | iplocate.io returns a ZIP containing CSV.
+    | CSV columns: network, continent_code, country_code, country_name
+    | Columns are resolved by header name, not position.
+    | Both plain CSV and ZIP-compressed CSV are supported automatically.
     |
     */
     'download_url' => env('GEOIP_DOWNLOAD_URL', 'https://www.iplocate.io/download/ip-to-country.csv'),
