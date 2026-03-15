@@ -25,6 +25,23 @@ Native Redis GeoIP lookup for Laravel using Redis 7+ Functions (`FCALL_RO`) and 
 | **Trusted Proxies** | `request()->ip()` must return the real client IP, not a load balancer or CDN address. See [Trusted Proxies](#trusted-proxies). |
 | **Network access** | The server running `geoip:update` must be able to reach the CSV download URL (iplocate.io by default). |
 
+### Redis-compatible alternatives
+
+This package requires `FUNCTION LOAD` and `FCALL_RO` commands (Redis 7.0+). Not all Redis-compatible databases support them:
+
+| Database | FCALL_RO support | Notes |
+|---|---|---|
+| **Redis** 7+ | Yes | Full support. The reference implementation. |
+| **Valkey** 7+ | Yes | Redis fork by Linux Foundation. Full FCALL_RO support since 7.0.0. |
+| **Apache Kvrocks** 2.7+ | Yes | Supported since v2.7.0, including read-only replica execution. |
+| **Dragonfly** | **No** | Only supports Lua scripting (`EVAL`/`EVALSHA`). `FUNCTION LOAD` / `FCALL_RO` are not implemented. |
+| **KeyDB** | **No** | Based on Redis 6.x codebase. Does not support Redis 7 Functions. |
+| **Amazon ElastiCache** | Check version | Supported only on Redis 7+ engine. Serverless or version ≥ 7.0 required. |
+| **Azure Cache for Redis** | Check tier | Enterprise and Premium tiers with Redis 7+ engine. |
+| **Google Memorystore** | Check version | Supported if running Redis 7+ engine. |
+
+> **If your Redis alternative does not support FCALL_RO**, this package will not work. There is no EVAL/EVALSHA fallback by design — FCALL_RO provides persistence, read-replica support, and better performance that EVAL cannot match.
+
 ## Installation
 
 ```bash
