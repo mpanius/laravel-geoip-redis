@@ -8,6 +8,60 @@ Native Redis GeoIP lookup for Laravel using Redis 7+ Functions (`FCALL_RO`) and 
 
 [README на русском](README_RU.md)
 
+## Why this package?
+
+There are several ways to resolve a client IP to a country. Each has trade-offs:
+
+| Approach | Where lookup runs | Latency | Multi-node | Data freshness | Setup effort |
+|---|---|---|---|---|---|
+| **This package** | Redis (FCALL_RO) | <1 ms | Shared Redis, update once | Daily CSV auto-update | Medium |
+| **nginx geoip2 module** | nginx (C, in-process) | ~0 ms | Per-node mmdb file | Manual download + reload | High (recompile/module) |
+| **Cloudflare CF-IPCountry** | Cloudflare edge | 0 ms (header) | Automatic | Always current | Low (enable toggle) |
+| **Torann/laravel-geoip** | PHP (MaxMind Reader) | <1 ms | Per-node mmdb file | Manual or `geoip:update` | Medium |
+| **MaxMind GeoIP2 PHP** | PHP (binary search in mmdb) | <1 ms | Per-node mmdb file | Manual download | Medium |
+| **API services** (ipinfo, iplocate, ip-api) | External HTTP | 50–200 ms | N/A | Always current | Low |
+
+### Key differences
+
+**vs nginx geoip2 module**
+- nginx module is the fastest (~0 ms, in-process C code) but requires a `.mmdb` file **on every node**, nginx recompilation or dynamic module loading, and a manual reload after each database update. This package loads data into shared Redis once — all nodes read from it immediately, no nginx reload needed.
+
+**vs Cloudflare CF-IPCountry**
+- Cloudflare is zero-effort if you're already behind Cloudflare. But it only works when traffic goes through CF. Internal traffic, health checks, queue workers, and non-CF environments get no header. This package works for any IP, from any context (HTTP, CLI, queues).
+
+**vs Torann/laravel-geoip (MaxMind)**
+- laravel-geoip loads the `.mmdb` file into PHP process memory and runs binary search in PHP. Each FPM/Octane worker holds its own copy in RAM. This package offloads all parsing to Redis — PHP workers stay lightweight. With Octane/FrankenPHP (long-lived processes), this prevents mmdb memory duplication across workers.
+
+**vs API services**
+- HTTP API calls add 50–200 ms latency per request and require rate limiting / caching. This package is a single Redis command (<1 ms) with no external dependency at request time.
+
+### Multi-node architecture
+
+```
+┌─────────────┐
+│  Scheduler   │  php artisan geoip:update (runs once, daily)
+│  (any node)  │──────────────┐
+└─────────────┘              │
+                              ▼
+                     ┌─────────────────┐
+                     │   Shared Redis   │  Sorted Set + Lua Function
+                     │   (common host)  │  stored globally in Redis
+                     └────────┬────────┘
+                              │ FCALL_RO
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+        ┌──────────┐   ┌──────────┐   ┌──────────┐
+        │  App #1  │   │  App #2  │   │  App #3  │
+        │ (FPM/    │   │ (FPM/    │   │ (FPM/    │
+        │  Octane) │   │  Octane) │   │  Octane) │
+        └──────────┘   └──────────┘   └──────────┘
+```
+
+- **Update once**: `geoip:update` runs on a single node (scheduler, cron, or manually). Data is written to shared Redis.
+- **Read from anywhere**: All application nodes call `FCALL_RO` against the same Redis. The Lua function is registered globally in Redis, not per-connection.
+- **No file sync needed**: Unlike mmdb-based solutions, there is no need to distribute database files across nodes.
+- **Read replicas**: If your Redis has replicas, `FCALL_RO` (with `no-writes` flag) can execute on replicas, offloading the primary.
+
 ## Requirements
 
 - PHP 8.2+
