@@ -128,15 +128,18 @@ Add a dedicated Redis connection in `config/database.php`:
         'password' => env('REDIS_PASSWORD'),
         'port' => env('REDIS_PORT', '6379'),
         'database' => env('REDIS_GEOIP_DB', '3'),
-        // REQUIRED: Lua function parses members as plain strings.
-        // Serialization/compression would produce binary data Lua can't read.
-        'serializer' => 0,  // Redis::SERIALIZER_NONE
-        'compression' => 0, // Redis::COMPRESSION_NONE
+        'prefix' => '',
+        'options' => [
+            // REQUIRED: overrides global igbinary/zstd serialization.
+            // Lua function parses members as plain strings — binary data would break it.
+            'serializer' => 0,   // Redis::SERIALIZER_NONE
+            'compression' => 0,  // Redis::COMPRESSION_NONE
+        ],
     ],
 ],
 ```
 
-> **Why `SERIALIZER_NONE`?** The Lua function reads Sorted Set members as plain strings (`"RU:3232235520"`) and splits on `:` via `string.find()`. If phpredis applies igbinary serialization or zstd compression, the member becomes binary data that Lua cannot parse.
+> **Why `SERIALIZER_NONE`?** The Lua function reads Sorted Set members as plain strings (`"RU:3232235520"`) and splits on `:` via `string.find()`. If phpredis applies igbinary serialization or zstd compression (typically set in global `redis.options`), the member becomes binary data that Lua cannot parse. Per-connection `options` override the global ones.
 
 ## Usage
 

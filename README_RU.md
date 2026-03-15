@@ -119,14 +119,17 @@ Redis connection в `config/database.php`:
     'password' => env('REDIS_PASSWORD'),
     'port' => env('REDIS_PORT', '6379'),
     'database' => env('REDIS_GEOIP_DB', '3'),
-    // ОБЯЗАТЕЛЬНО: Lua function парсит member как plain string ("CC:start_ip").
-    // Сериализация/компрессия превратит данные в бинарный формат, который Lua не сможет прочитать.
-    'serializer' => 0,  // Redis::SERIALIZER_NONE
-    'compression' => 0, // Redis::COMPRESSION_NONE
+    'prefix' => '',
+    'options' => [
+        // ОБЯЗАТЕЛЬНО: переопределяет глобальную igbinary/zstd сериализацию.
+        // Lua function парсит member как plain string — бинарные данные сломают парсинг.
+        'serializer' => 0,   // Redis::SERIALIZER_NONE
+        'compression' => 0,  // Redis::COMPRESSION_NONE
+    ],
 ],
 ```
 
-> **Почему `SERIALIZER_NONE`?** Lua function внутри Redis читает member Sorted Set как plain string (`"RU:3232235520"`) и разделяет по `:` через `string.find()`. Если phpredis применит igbinary сериализацию или zstd компрессию, member превратится в бинарные данные, которые Lua не сможет распарсить.
+> **Почему `SERIALIZER_NONE`?** Lua function внутри Redis читает member Sorted Set как plain string (`"RU:3232235520"`) и разделяет по `:` через `string.find()`. Если phpredis применит igbinary сериализацию или zstd компрессию (обычно заданные в глобальных `redis.options`), member превратится в бинарные данные, которые Lua не сможет распарсить. Per-connection `options` переопределяют глобальные.
 
 ## Использование
 
