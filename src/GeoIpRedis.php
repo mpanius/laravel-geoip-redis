@@ -212,7 +212,7 @@ class GeoIpRedis
 
         // Parse header to find column indices dynamically
         // iplocate.io format: network,continent_code,country_code,country_name
-        $header = fgetcsv($handle);
+        $header = fgetcsv($handle, null, ',', '"', '\\');
         if ($header === false) {
             fclose($handle);
             throw new RuntimeException('CSV file is empty or has no header row.');
@@ -237,7 +237,7 @@ class GeoIpRedis
         $batchSize = $this->config('pipeline_batch_size');
         $ipv6Enabled = $this->config('ipv6_enabled');
 
-        while (($row = fgetcsv($handle)) !== false) {
+        while (($row = fgetcsv($handle, null, ',', '"', '\\')) !== false) {
             if (count($row) <= max($networkIdx, $countryCodeIdx)) {
                 $skippedInvalid++;
                 continue;
