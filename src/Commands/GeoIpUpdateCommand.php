@@ -15,7 +15,7 @@ class GeoIpUpdateCommand extends Command
         {--status : Show current status without updating}
         {--register-function : Only register/update the Lua function in Redis}';
 
-    protected $description = 'Download and load GeoIP ip-to-country data into Redis';
+    protected $description = 'Download (or read from a Storage disk) and load GeoIP ip-to-country data into Redis';
 
     public function handle(GeoIpRedis $service): int
     {
@@ -38,7 +38,7 @@ class GeoIpUpdateCommand extends Command
             return self::SUCCESS;
         }
 
-        $this->info('Downloading GeoIP database...');
+        $this->info($service->usesDiskSource() ? 'Loading GeoIP database from disk...' : 'Downloading GeoIP database...');
 
         try {
             $result = $service->update();
@@ -91,6 +91,7 @@ class GeoIpUpdateCommand extends Command
                 ['Memory usage (IPv4)', "{$memoryMb} MB"],
                 ['Memory usage (IPv6)', "{$memoryMbV6} MB"],
                 ['Source', $status['source'] ?? 'N/A'],
+                ['Source file modified', $status['source_last_modified'] ? date('Y-m-d H:i:s', $status['source_last_modified']) : 'N/A'],
                 ['Needs update', $service->needsUpdate() ? 'YES' : 'no'],
                 ['Connection', config('geoip-redis.connection')],
                 ['Redis key', config('geoip-redis.key')],

@@ -266,6 +266,21 @@ Score в Sorted Set — double (53 бита точности для целых),
 - Формат: `network,country,country_code,continent_code`
 - IPv4 и IPv6 в одном файле (2026-10-26: 787 197 IPv4 + 1 368 672 IPv6 строк)
 
+### Источник: диск Laravel (S3)
+
+Вместо скачивания по URL `geoip:update` может читать CSV (или ZIP с CSV) с любого диска Laravel Storage, например S3 или Garage. Удобно, когда файл кладётся один раз и общий для всех нод, или у нод нет доступа в интернет. Ключ API не нужен.
+
+```dotenv
+GEOIP_SOURCE_DISK=s3                          # имя диска из config/filesystems.php; пусто = скачивание по URL
+GEOIP_SOURCE_PATH=geoip/ip-to-country.csv     # путь на диске (по умолчанию)
+```
+
+- Файл читается потоком (`Storage::disk($disk)->readStream()`) во временный файл; CSV и ZIP определяются по содержимому, как для URL.
+- Без `GEOIP_SOURCE_DISK` ничего не меняется: файл скачивается с `GEOIP_DOWNLOAD_URL`.
+- `needsUpdate()` сравнивает `lastModified` и размер файла с `source_last_modified` / `source_size` из `geoip:meta`: файл новее (или другого размера) либо данные загружены из другого источника - обновление; иначе действует обычный `GEOIP_UPDATE_INTERVAL`. `--force` перезагружает всегда.
+- Файла нет или он не читается: `geoip:update` печатает `Update failed: Cannot read GeoIP source ...` и выходит с кодом 1, ключи Redis не трогаются. Сам `needsUpdate()` на ошибке диска не бросает исключение.
+- `geoip:update --status` показывает `Source` как `disk:<диск>:<путь>` и время изменения загруженного файла.
+
 ## Trusted Proxies
 
 Чтобы `request()->ip()` возвращал реальный IP клиента (а не адрес балансировщика или CDN), **необходимо** настроить trusted proxies.

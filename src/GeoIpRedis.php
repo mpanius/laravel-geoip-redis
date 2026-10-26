@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace Mpanius\GeoIpRedis;
 
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\Storage;
 use Mpanius\GeoIpRedis\Support\CidrConverter;
 use Mpanius\GeoIpRedis\Support\CsvDownloader;
 use Redis as PhpRedis;
 use RedisException;
 use RuntimeException;
+use Throwable;
 
 class GeoIpRedis
 {
@@ -63,23 +65,103 @@ class GeoIpRedis
     }
 
     /**
-     * Download CSV and load GeoIP data into Redis.
+     * Download CSV (or read it from the configured Storage disk) and load GeoIP data into Redis.
      */
     public function update(): UpdateResult
     {
         $startTime = microtime(true);
+        $extraMeta = [];
 
-        $csvPath = CsvDownloader::download(
-            $this->config('download_url'),
-            $this->config('api_key'),
-            $this->config('variant'),
-        );
+        if ($this->usesDiskSource()) {
+            [$csvPath, $extraMeta] = $this->fetchFromDisk();
+        } else {
+            $csvPath = CsvDownloader::download(
+                $this->config('download_url'),
+                $this->config('api_key'),
+                $this->config('variant'),
+            );
+        }
 
         try {
-            return $this->importCsv($csvPath, $startTime);
+            return $this->importCsv($csvPath, $startTime, $extraMeta);
         } finally {
             @unlink($csvPath);
         }
+    }
+
+    /**
+     * True when the CSV comes from a Laravel Storage disk (geoip-redis.source_disk) instead of a URL.
+     */
+    public function usesDiskSource(): bool
+    {
+        return $this->sourceDisk() !== null;
+    }
+
+    protected function sourceDisk(): ?string
+    {
+        $disk = $this->config('source_disk');
+
+        return is_string($disk) && $disk !== '' ? $disk : null;
+    }
+
+    protected function sourcePath(): string
+    {
+        return (string) $this->config('source_path');
+    }
+
+    /**
+     * Value of meta field "source": URL or "disk:<disk>:<path>".
+     */
+    protected function sourceLabel(): string
+    {
+        return $this->usesDiskSource()
+            ? 'disk:' . $this->sourceDisk() . ':' . $this->sourcePath()
+            : (string) $this->config('download_url');
+    }
+
+    /**
+     * Read the source file from the Storage disk into a temp CSV (ZIP is unpacked).
+     *
+     * lastModified/size are taken BEFORE reading: a file replaced mid-read is seen as newer next time.
+     * Redis is not touched here, so a read error leaves the previous data intact.
+     *
+     * @return array{0: string, 1: array<string, string>} [temp csv path, extra meta fields]
+     *
+     * @throws RuntimeException
+     */
+    protected function fetchFromDisk(): array
+    {
+        $diskName = $this->sourceDisk();
+        $path = $this->sourcePath();
+
+        try {
+            $disk = Storage::disk($diskName);
+
+            if (! $disk->exists($path)) {
+                throw new RuntimeException('file does not exist');
+            }
+
+            $lastModified = $disk->lastModified($path);
+            $size = $disk->size($path);
+            $stream = $disk->readStream($path);
+
+            if (! is_resource($stream)) {
+                throw new RuntimeException('cannot open file for reading');
+            }
+
+            try {
+                $csvPath = CsvDownloader::fromStream($stream, 'source file');
+            } finally {
+                fclose($stream);
+            }
+        } catch (Throwable $e) {
+            throw new RuntimeException("Cannot read GeoIP source '{$path}' from disk '{$diskName}': {$e->getMessage()}", 0, $e);
+        }
+
+        return [$csvPath, [
+            'source_last_modified' => (string) $lastModified,
+            'source_size' => (string) $size,
+        ]];
     }
 
     /**
@@ -90,8 +172,10 @@ class GeoIpRedis
      * 3. Atomic RENAME to production keys (zero downtime)
      * 4. Registers/updates Lua function
      * 5. Saves metadata
+     *
+     * @param array<string, string> $extraMeta additional meta hash fields (disk source: source_last_modified, source_size)
      */
-    public function importCsv(string $csvPath, ?float $startTime = null): UpdateResult
+    public function importCsv(string $csvPath, ?float $startTime = null, array $extraMeta = []): UpdateResult
     {
         $startTime ??= microtime(true);
 
@@ -119,7 +203,12 @@ class GeoIpRedis
 
         $this->registerFunction();
 
-        $this->redis()->hMSet($this->config('meta_key'), [
+        // File markers of a previous disk source must not outlive a switch back to the URL source
+        if ($extraMeta === []) {
+            $this->redis()->hDel($this->config('meta_key'), 'source_last_modified', 'source_size');
+        }
+
+        $this->redis()->hMSet($this->config('meta_key'), $extraMeta + [
             'updated_at' => (string) now()->timestamp,
             'entries_count' => (string) $count,
             'ipv6_entries_count' => (string) $countV6,
@@ -127,7 +216,7 @@ class GeoIpRedis
             'skipped_ipv6' => (string) $skippedIpv6,
             'skipped_empty' => (string) $skippedEmpty,
             'skipped_invalid' => (string) $skippedInvalid,
-            'source' => $this->config('download_url'),
+            'source' => $this->sourceLabel(),
         ]);
 
         return new UpdateResult(
@@ -181,7 +270,10 @@ class GeoIpRedis
     }
 
     /**
-     * Check if GeoIP data needs updating based on configured interval.
+     * Check if GeoIP data needs updating.
+     *
+     * Disk source: true when the file is newer (or of a different size) than the one loaded,
+     * or the loaded data came from another source; otherwise the configured interval decides.
      */
     public function needsUpdate(): bool
     {
@@ -191,15 +283,41 @@ class GeoIpRedis
             return true;
         }
 
+        if ($this->usesDiskSource() && $this->diskFileChanged($meta)) {
+            return true;
+        }
+
         $intervalSeconds = $this->config('update_interval_hours') * 3600;
 
         return (now()->timestamp - $meta['updated_at']) > $intervalSeconds;
     }
 
     /**
+     * @param array{source: string|null, source_last_modified: int|null, source_size: int|null} $meta
+     */
+    protected function diskFileChanged(array $meta): bool
+    {
+        if ($meta['source'] !== $this->sourceLabel() || $meta['source_last_modified'] === null) {
+            return true;
+        }
+
+        try {
+            $disk = Storage::disk($this->sourceDisk());
+            $lastModified = $disk->lastModified($this->sourcePath());
+            $size = $disk->size($this->sourcePath());
+        } catch (Throwable) {
+            // Unreadable here -> let the interval decide; update() reports the real error
+            return false;
+        }
+
+        return $lastModified > $meta['source_last_modified']
+            || ($meta['source_size'] !== null && $size !== $meta['source_size']);
+    }
+
+    /**
      * Get current GeoIP status and metadata.
      *
-     * @return array{updated_at: int|null, entries_count: int, ipv6_entries_count: int, ipv6_memory_bytes: int, ipv6_sorted_set_card: int, skipped_ipv6: int, skipped_empty: int, skipped_invalid: int, source: string|null, memory_bytes: int, sorted_set_card: int}
+     * @return array{updated_at: int|null, entries_count: int, ipv6_entries_count: int, ipv6_memory_bytes: int, ipv6_sorted_set_card: int, skipped_ipv6: int, skipped_empty: int, skipped_invalid: int, source: string|null, source_last_modified: int|null, source_size: int|null, memory_bytes: int, sorted_set_card: int}
      */
     public function status(): array
     {
@@ -227,6 +345,8 @@ class GeoIpRedis
             'skipped_empty' => isset($meta['skipped_empty']) ? (int) $meta['skipped_empty'] : 0,
             'skipped_invalid' => isset($meta['skipped_invalid']) ? (int) $meta['skipped_invalid'] : 0,
             'source' => $meta['source'] ?? null,
+            'source_last_modified' => isset($meta['source_last_modified']) ? (int) $meta['source_last_modified'] : null,
+            'source_size' => isset($meta['source_size']) ? (int) $meta['source_size'] : null,
             'memory_bytes' => $memoryBytes,
             'sorted_set_card' => (int) $redis->zCard($key),
             'ipv6_memory_bytes' => $memoryBytesV6,

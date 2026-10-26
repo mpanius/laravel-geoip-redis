@@ -37,11 +37,6 @@ class CsvDownloader
             $downloadUrl .= $separator . http_build_query($params);
         }
 
-        $tempPath = tempnam(sys_get_temp_dir(), 'geoip_');
-        if ($tempPath === false) {
-            throw new RuntimeException('Failed to create temp file for GeoIP download.');
-        }
-
         $context = stream_context_create([
             'http' => [
                 'timeout' => 120,
@@ -51,32 +46,57 @@ class CsvDownloader
 
         $source = @fopen($downloadUrl, 'r', false, $context);
         if ($source === false) {
-            @unlink($tempPath);
             throw new RuntimeException("Failed to download GeoIP data from: {$url}");
+        }
+
+        try {
+            return self::fromStream($source);
+        } finally {
+            fclose($source);
+        }
+    }
+
+    /**
+     * Copy a readable stream (HTTP response, Storage disk) to a temp file.
+     *
+     * Plain CSV and ZIP-compressed CSV are recognised by magic bytes; for ZIP
+     * the first .csv entry is extracted. The caller closes $source.
+     *
+     * @param resource $source
+     * @param string $what name of the source for the "empty file" message
+     *
+     * @return string Path to the CSV temp file (caller must unlink)
+     *
+     * @throws RuntimeException
+     */
+    public static function fromStream($source, string $what = 'download'): string
+    {
+        $tempPath = tempnam(sys_get_temp_dir(), 'geoip_');
+        if ($tempPath === false) {
+            throw new RuntimeException('Failed to create temp file for GeoIP data.');
         }
 
         $dest = fopen($tempPath, 'w');
         if ($dest === false) {
-            fclose($source);
             @unlink($tempPath);
             throw new RuntimeException("Failed to open temp file for writing: {$tempPath}");
         }
 
         $bytes = stream_copy_to_stream($source, $dest);
-        fclose($source);
         fclose($dest);
 
         if ($bytes === false || $bytes === 0) {
             @unlink($tempPath);
-            throw new RuntimeException('GeoIP download resulted in empty file.');
+            throw new RuntimeException("GeoIP {$what} resulted in empty file.");
         }
 
         // Detect ZIP and extract CSV
         if (self::isZipFile($tempPath)) {
-            $csvPath = self::extractCsvFromZip($tempPath);
-            @unlink($tempPath); // Remove the ZIP
-
-            return $csvPath;
+            try {
+                return self::extractCsvFromZip($tempPath);
+            } finally {
+                @unlink($tempPath); // Remove the ZIP
+            }
         }
 
         return $tempPath;

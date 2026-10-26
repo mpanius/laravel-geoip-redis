@@ -276,6 +276,21 @@ Default: [iplocate.io](https://www.iplocate.io) IP-to-Country CSV
 - Format: `network,country,country_code,continent_code`
 - IPv4 and IPv6 rows are in the same file (2026-10-26: 787,197 IPv4 + 1,368,672 IPv6)
 
+### Source: Laravel disk (S3)
+
+Instead of downloading by URL, `geoip:update` can read the CSV (or ZIP with a CSV) from any Laravel Storage disk, e.g. S3 or Garage. Useful when the file is fetched once and shared by all nodes, or when the nodes have no access to the internet. The API key is not needed.
+
+```dotenv
+GEOIP_SOURCE_DISK=s3                          # disk name from config/filesystems.php; empty = download by URL
+GEOIP_SOURCE_PATH=geoip/ip-to-country.csv     # path on the disk (default)
+```
+
+- The file is streamed (`Storage::disk($disk)->readStream()`) into a temp file; CSV and ZIP are detected by content, like for the URL.
+- Without `GEOIP_SOURCE_DISK` nothing changes: the file is downloaded from `GEOIP_DOWNLOAD_URL`.
+- `needsUpdate()` compares the file's `lastModified` and size with `source_last_modified` / `source_size` saved in `geoip:meta`: a newer (or differently sized) file, or data loaded from another source, means an update; otherwise the usual `GEOIP_UPDATE_INTERVAL` applies. `--force` always reloads.
+- If the file is missing or unreadable, `geoip:update` prints `Update failed: Cannot read GeoIP source ...` and exits with code 1; the Redis keys are not touched. `needsUpdate()` itself never throws on a disk error.
+- `geoip:update --status` shows `Source` as `disk:<disk>:<path>` and the loaded file's modification time.
+
 ## Trusted Proxies
 
 For `request()->ip()` to return the real client IP (not a load balancer or CDN address), you **must** configure trusted proxies in your Laravel application.
@@ -327,6 +342,8 @@ Common setups:
 | `key` | `GEOIP_REDIS_KEY` | `geoip:v4` | Sorted Set key |
 | `download_url` | `GEOIP_DOWNLOAD_URL` | iplocate.io CSV | CSV download URL |
 | `api_key` | `GEOIP_API_KEY` | — | API key for download service |
+| `source_disk` | `GEOIP_SOURCE_DISK` | `null` | Laravel Storage disk to read the CSV from (`null` = download by `download_url`) |
+| `source_path` | `GEOIP_SOURCE_PATH` | `geoip/ip-to-country.csv` | File path on `source_disk` |
 | `variant` | `GEOIP_VARIANT` | `daily` | Download variant |
 | `update_interval_hours` | `GEOIP_UPDATE_INTERVAL` | `24` | Min hours between updates |
 | `key_v6` | `GEOIP_REDIS_KEY_V6` | `geoip:v6` | IPv6 Sorted Set key (lex-ordered members) |
