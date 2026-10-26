@@ -12,6 +12,8 @@ class UpdateResult
         public readonly int $skippedIpv6 = 0,
         public readonly int $skippedEmpty = 0,
         public readonly int $skippedInvalid = 0,
+        public readonly int $ipv6EntriesCount = 0,
+        public readonly int $ipv6RowsCount = 0,
     ) {}
 
     public function totalSkipped(): int

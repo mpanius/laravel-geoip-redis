@@ -169,6 +169,10 @@ use Mpanius\GeoIpRedis\Facades\GeoIpRedis;
 GeoIpRedis::lookup('8.8.8.8');     // "US"
 GeoIpRedis::lookup('77.88.55.77'); // "RU"
 GeoIpRedis::lookup('invalid');     // null
+
+// IPv6 (needs GEOIP_IPV6_ENABLED=true at load time, see "IPv6")
+GeoIpRedis::lookup('2a02:6b8::1');           // "RU"
+GeoIpRedis::lookup('::ffff:8.8.8.8');        // "US" — IPv4-mapped is resolved as IPv4 (works without IPv6 data)
 ```
 
 Via dependency injection:
@@ -204,20 +208,51 @@ CSV (iplocate.io)
 
 ### Redis data structure
 
-**Sorted Set** (`geoip:v4`):
+**IPv4 — Sorted Set** (`geoip:v4`):
 - **Score**: `end_ip` (unsigned 32-bit integer from CIDR)
 - **Member**: `"CC:start_ip"` (e.g. `"RU:3232235520"`)
+
+**IPv6 — Sorted Set** (`geoip:v6`, only with `GEOIP_IPV6_ENABLED=true`):
+- **Score**: `0` for every member
+- **Member**: `"<end_hex32>:<start_hex32>:CC"` — 128-bit addresses as 32 lowercase hex chars (e.g. `"20010db8ffffffffffffffffffffffff:20010db8000000000000000000000000:DE"`)
 
 ### Lookup algorithm (runs entirely in Redis)
 
 ```lua
+-- IPv4
 ZRANGEBYSCORE geoip:v4 <ip_integer> +inf LIMIT 0 1
+-- IPv6
+ZRANGEBYLEX   geoip:v6 [<ip_hex32> + LIMIT 0 1
 -- → finds the first range where end_ip >= query_ip
 -- → verifies start_ip <= query_ip
 -- → returns country code or false
 ```
 
-Complexity: **O(log N)** per lookup.
+Complexity: **O(log N)** per lookup for both families.
+
+### IPv6
+
+A Sorted Set score is a double (53 bits of integer precision), so a 128-bit address cannot be a score without losing precision. Instead all members get score `0` and Redis orders them **lexicographically** by the member string. Fixed-width lowercase hex sorts exactly like the number it encodes, so putting `end` first makes `ZRANGEBYLEX key [<ip> + LIMIT 0 1` return the first range with `end >= ip`, just like `ZRANGEBYSCORE` does for IPv4. The Lua function then checks `start <= ip` (compared in 8-char chunks, independent of the server locale). This is exact for every /0../128 prefix, needs no extension (no GMP/bcmath) and has the same O(log N) cost as IPv4.
+
+- The Lua function keeps its name and signature (`FCALL_RO geoip_country 1 <key> <arg>`): a 32-char hex argument is an IPv6 lookup against `KEYS[1]`, a decimal argument is IPv4. The PHP side picks the key.
+- **IPv4-mapped** addresses (`::ffff:a.b.c.d`) are converted to IPv4 in PHP and resolved against the IPv4 key, so they work even with IPv6 disabled. Zone IDs (`fe80::1%eth0`) are stripped.
+- At load time contiguous ranges of the same country are **merged** (the lookup result is identical). On the 2026-10-26 iplocate CSV this turns 1,368,672 IPv6 rows into 471,973 ranges.
+- IPv6 and IPv4 are swapped independently and atomically (`geoip:v6:loading` → `RENAME`). If a new CSV has no IPv6 rows the previous `geoip:v6` is left untouched.
+- Lookup of an IPv6 address always queries `geoip:v6`, regardless of `ipv6_enabled` (the flag only controls loading): no data means `null`.
+
+**Enabling**: set `GEOIP_IPV6_ENABLED=true` on the node that runs `geoip:update`, run `php artisan geoip:update --register-function` (loads the new Lua version; the old one safely returns `null` for IPv6 and still serves IPv4) and then `php artisan geoip:update --force`.
+
+**Cost** (iplocate CSV 2026-10-26, Redis 7.4, `MEMORY USAGE`; 787,197 IPv4 rows, 1,368,672 IPv6 rows):
+
+| | Entries | Redis memory | Load time |
+|---|---|---|---|
+| `geoip:v4` | 787,197 | ~71–74 MB | ~3.7 s |
+| `geoip:v6` (merged) | 471,973 | ~72 MB | ~7 s more |
+| `geoip:v6` (not merged, for reference) | 1,368,672 | ~222 MB | — |
+
+Plan for: **+~72 MB of Redis memory**, up to **2x of the whole set at the moment of the swap** (old and new key coexist until `RENAME`; `maxmemory` must cover it), and **~210 MB of PHP memory** in the process running `geoip:update` (IPv6 rows are sorted in memory to merge them; set `memory_limit` accordingly, e.g. `php -d memory_limit=512M artisan geoip:update`). Reads are unaffected: server-side `FCALL_RO` takes ~0.05 ms for both families (redis-benchmark, 1 client, localhost; the previous IPv4-only function measured the same within noise).
+
+**Requirements**: Redis 7+ / Valkey 7+ (Functions, `FCALL_RO`; `ZRANGEBYLEX ... LIMIT` has been available since 2.8.9), connection with `serializer=NONE` and `compression=NONE` as before.
 
 ### Why FCALL_RO over EVAL/EVALSHA
 
@@ -230,7 +265,7 @@ Complexity: **O(log N)** per lookup.
 
 ### Zero-downtime updates
 
-Data is loaded into a temporary key (`geoip:v4:loading`), then atomically swapped via `RENAME`. Lookups never see partially loaded data.
+Data is loaded into a temporary key (`geoip:v4:loading`, and `geoip:v6:loading` for IPv6), then atomically swapped via `RENAME`. Lookups never see partially loaded data.
 
 ## Data source
 
@@ -239,6 +274,7 @@ Default: [iplocate.io](https://www.iplocate.io) IP-to-Country CSV
 - Updated daily
 - License: CC BY-SA 4.0
 - Format: `network,country,country_code,continent_code`
+- IPv4 and IPv6 rows are in the same file (2026-10-26: 787,197 IPv4 + 1,368,672 IPv6)
 
 ## Trusted Proxies
 
@@ -280,7 +316,7 @@ Common setups:
       ?: 'US';
   ```
 - **Read replicas**: Since the Lua function is registered with `flags = {'no-writes'}`, lookups via `FCALL_RO` work on Redis read replicas — ideal for scaling reads.
-- **Monitor memory**: Check Redis memory usage with `geoip:update --status`. IPv4-only data typically uses 50–100 MB.
+- **Monitor memory**: Check Redis memory usage with `geoip:update --status`. IPv4-only data typically uses 50–100 MB; IPv6 adds ~70 MB.
 - **Verify after deploy**: After deploying to a new server, run `geoip:update --register-function` to ensure the Lua function is loaded (it persists in RDB/AOF, but a fresh Redis instance won't have it).
 
 ## Config reference
@@ -293,7 +329,8 @@ Common setups:
 | `api_key` | `GEOIP_API_KEY` | — | API key for download service |
 | `variant` | `GEOIP_VARIANT` | `daily` | Download variant |
 | `update_interval_hours` | `GEOIP_UPDATE_INTERVAL` | `24` | Min hours between updates |
-| `ipv6_enabled` | `GEOIP_IPV6_ENABLED` | `false` | Process IPv6 CIDR entries |
+| `key_v6` | `GEOIP_REDIS_KEY_V6` | `geoip:v6` | IPv6 Sorted Set key (lex-ordered members) |
+| `ipv6_enabled` | `GEOIP_IPV6_ENABLED` | `false` | Load IPv6 CIDR entries into `key_v6` (off by default: +~72 MB Redis, ~210 MB PHP during update) |
 | `pipeline_batch_size` | — | `5000` | Batch size for pipeline ZADD |
 | `function_library` | — | `geoip` | Redis Function library name |
 | `function_name` | — | `geoip_country` | Redis Function name |

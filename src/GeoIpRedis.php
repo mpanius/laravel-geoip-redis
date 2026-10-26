@@ -19,26 +19,42 @@ class GeoIpRedis
     protected ?PhpRedis $redisClient = null;
 
     /**
-     * Look up country code by IPv4 address.
+     * Look up country code by IPv4 or IPv6 address.
      *
      * Uses FCALL_RO — the entire lookup happens inside Redis,
      * PHP only sends the command and receives the result string.
+     * IPv4-mapped IPv6 (::ffff:a.b.c.d) is resolved as IPv4.
      *
      * @return string|null Two-letter country code (e.g. "RU", "US") or null
      */
     public function lookup(string $ip): ?string
     {
         $ipLong = CidrConverter::ipToLong($ip);
-        if ($ipLong === null) {
+        if ($ipLong !== null) {
+            return $this->fcall($this->config('key'), (string) $ipLong);
+        }
+
+        if (! str_contains($ip, ':')) {
             return null;
         }
 
+        $hex = CidrConverter::ipv6ToHex($ip);
+        if ($hex === null) {
+            return null;
+        }
+
+        $mapped = CidrConverter::mappedIpv4ToLong($hex);
+        if ($mapped !== null) {
+            return $this->fcall($this->config('key'), (string) $mapped);
+        }
+
+        return $this->fcall($this->config('key_v6'), $hex);
+    }
+
+    protected function fcall(string $key, string $arg): ?string
+    {
         try {
-            $result = $this->redis()->fcall_ro(
-                $this->config('function_name'),
-                [$this->config('key')],
-                [(string) $ipLong],
-            );
+            $result = $this->redis()->fcall_ro($this->config('function_name'), [$key], [$arg]);
         } catch (RedisException) {
             return null;
         }
@@ -48,19 +64,11 @@ class GeoIpRedis
 
     /**
      * Download CSV and load GeoIP data into Redis.
-     *
-     * 1. Downloads CSV to temp file
-     * 2. Parses CIDR → integer ranges
-     * 3. Loads into temp Redis key via pipeline
-     * 4. Atomic RENAME to production key (zero downtime)
-     * 5. Registers/updates Lua function
-     * 6. Saves metadata
      */
     public function update(): UpdateResult
     {
         $startTime = microtime(true);
 
-        // 1. Download CSV
         $csvPath = CsvDownloader::download(
             $this->config('download_url'),
             $this->config('api_key'),
@@ -68,43 +76,68 @@ class GeoIpRedis
         );
 
         try {
-            // 2+3. Parse and load into temp key
-            $tempKey = $this->config('key') . ':loading';
-            [$count, $skippedIpv6, $skippedEmpty, $skippedInvalid] = $this->loadCsvToRedis($csvPath, $tempKey);
-
-            if ($count === 0) {
-                $this->redis()->del($tempKey);
-                throw new RuntimeException('CSV parsing resulted in zero entries — aborting to protect existing data.');
-            }
-
-            // 4. Atomic swap: RENAME temp → production (zero downtime)
-            $this->redis()->rename($tempKey, $this->config('key'));
-
-            // 5. Register/update Lua function
-            $this->registerFunction();
-
-            // 6. Save metadata
-            $totalSkipped = $skippedIpv6 + $skippedEmpty + $skippedInvalid;
-            $this->redis()->hMSet($this->config('meta_key'), [
-                'updated_at' => (string) now()->timestamp,
-                'entries_count' => (string) $count,
-                'skipped_ipv6' => (string) $skippedIpv6,
-                'skipped_empty' => (string) $skippedEmpty,
-                'skipped_invalid' => (string) $skippedInvalid,
-                'source' => $this->config('download_url'),
-            ]);
+            return $this->importCsv($csvPath, $startTime);
         } finally {
             @unlink($csvPath);
         }
+    }
 
-        $duration = round(microtime(true) - $startTime, 2);
+    /**
+     * Load a CSV file (network,country_code) into Redis.
+     *
+     * 1. Parses CIDR → integer ranges (IPv4) / hex ranges (IPv6, if ipv6_enabled)
+     * 2. Loads into temp Redis keys via pipeline
+     * 3. Atomic RENAME to production keys (zero downtime)
+     * 4. Registers/updates Lua function
+     * 5. Saves metadata
+     */
+    public function importCsv(string $csvPath, ?float $startTime = null): UpdateResult
+    {
+        $startTime ??= microtime(true);
+
+        $key = $this->config('key');
+        $keyV6 = $this->config('key_v6');
+        $tempKey = $key . ':loading';
+        $tempKeyV6 = $keyV6 . ':loading';
+
+        [$count, $countV6, $rowsV6, $skippedIpv6, $skippedEmpty, $skippedInvalid] = $this->loadCsvToRedis($csvPath, $tempKey, $tempKeyV6);
+
+        if ($count === 0) {
+            $this->redis()->del($tempKey, $tempKeyV6);
+            throw new RuntimeException('CSV parsing resulted in zero entries — aborting to protect existing data.');
+        }
+
+        // Atomic swap: RENAME temp → production (zero downtime)
+        $this->redis()->rename($tempKey, $key);
+
+        // IPv6 swap only when the new data has v6 ranges; otherwise keep the previous key
+        if ($countV6 > 0) {
+            $this->redis()->rename($tempKeyV6, $keyV6);
+        } else {
+            $this->redis()->del($tempKeyV6);
+        }
+
+        $this->registerFunction();
+
+        $this->redis()->hMSet($this->config('meta_key'), [
+            'updated_at' => (string) now()->timestamp,
+            'entries_count' => (string) $count,
+            'ipv6_entries_count' => (string) $countV6,
+            'ipv6_rows_count' => (string) $rowsV6,
+            'skipped_ipv6' => (string) $skippedIpv6,
+            'skipped_empty' => (string) $skippedEmpty,
+            'skipped_invalid' => (string) $skippedInvalid,
+            'source' => $this->config('download_url'),
+        ]);
 
         return new UpdateResult(
             entriesCount: $count,
-            duration: $duration,
+            duration: round(microtime(true) - $startTime, 2),
             skippedIpv6: $skippedIpv6,
             skippedEmpty: $skippedEmpty,
             skippedInvalid: $skippedInvalid,
+            ipv6EntriesCount: $countV6,
+            ipv6RowsCount: $rowsV6,
         );
     }
 
@@ -166,7 +199,7 @@ class GeoIpRedis
     /**
      * Get current GeoIP status and metadata.
      *
-     * @return array{updated_at: int|null, entries_count: int, skipped_ipv6: int, skipped_empty: int, skipped_invalid: int, source: string|null, memory_bytes: int, sorted_set_card: int}
+     * @return array{updated_at: int|null, entries_count: int, ipv6_entries_count: int, ipv6_memory_bytes: int, ipv6_sorted_set_card: int, skipped_ipv6: int, skipped_empty: int, skipped_invalid: int, source: string|null, memory_bytes: int, sorted_set_card: int}
      */
     public function status(): array
     {
@@ -176,9 +209,12 @@ class GeoIpRedis
         $key = $this->config('key');
 
         // Get memory usage for the sorted set (Redis 4+)
+        $keyV6 = $this->config('key_v6');
         $memoryBytes = 0;
+        $memoryBytesV6 = 0;
         try {
             $memoryBytes = (int) $redis->rawCommand('MEMORY', 'USAGE', $key);
+            $memoryBytesV6 = (int) $redis->rawCommand('MEMORY', 'USAGE', $keyV6);
         } catch (RedisException) {
             // Ignore if MEMORY command not available
         }
@@ -186,24 +222,27 @@ class GeoIpRedis
         return [
             'updated_at' => isset($meta['updated_at']) ? (int) $meta['updated_at'] : null,
             'entries_count' => isset($meta['entries_count']) ? (int) $meta['entries_count'] : 0,
+            'ipv6_entries_count' => isset($meta['ipv6_entries_count']) ? (int) $meta['ipv6_entries_count'] : 0,
             'skipped_ipv6' => isset($meta['skipped_ipv6']) ? (int) $meta['skipped_ipv6'] : 0,
             'skipped_empty' => isset($meta['skipped_empty']) ? (int) $meta['skipped_empty'] : 0,
             'skipped_invalid' => isset($meta['skipped_invalid']) ? (int) $meta['skipped_invalid'] : 0,
             'source' => $meta['source'] ?? null,
             'memory_bytes' => $memoryBytes,
             'sorted_set_card' => (int) $redis->zCard($key),
+            'ipv6_memory_bytes' => $memoryBytesV6,
+            'ipv6_sorted_set_card' => (int) $redis->zCard($keyV6),
         ];
     }
 
     /**
-     * Parse CSV and load entries into Redis Sorted Set via pipeline.
+     * Parse CSV and load entries into Redis Sorted Sets (IPv4 by score, IPv6 by lex order).
      *
-     * @return array{0: int, 1: int, 2: int, 3: int} [loaded, skipped_ipv6, skipped_empty, skipped_invalid]
+     * @return array{0: int, 1: int, 2: int, 3: int, 4: int, 5: int} [loaded_v4, stored_v6, rows_v6, skipped_ipv6, skipped_empty, skipped_invalid]
      */
-    protected function loadCsvToRedis(string $csvPath, string $key): array
+    protected function loadCsvToRedis(string $csvPath, string $key, string $keyV6): array
     {
         $redis = $this->redis();
-        $redis->del($key);
+        $redis->del($key, $keyV6);
 
         $handle = fopen($csvPath, 'r');
         if ($handle === false) {
@@ -230,6 +269,7 @@ class GeoIpRedis
         }
 
         $batch = [];
+        $rowsV6 = [];
         $count = 0;
         $skippedIpv6 = 0;
         $skippedEmpty = 0;
@@ -252,9 +292,21 @@ class GeoIpRedis
                 continue;
             }
 
-            // Skip IPv6 if disabled
-            if (! $ipv6Enabled && str_contains($network, ':')) {
-                $skippedIpv6++;
+            if (str_contains($network, ':')) {
+                if (! $ipv6Enabled) {
+                    $skippedIpv6++;
+                    continue;
+                }
+
+                [$startHex, $endHex] = CidrConverter::toRangeV6($network);
+                if ($startHex === null) {
+                    $skippedInvalid++;
+                    continue;
+                }
+
+                // Packed "start(16) end(16) cc": sorts by start, ~3x lighter than hex in PHP memory
+                $rowsV6[] = hex2bin($startHex) . hex2bin($endHex) . $countryCode;
+
                 continue;
             }
 
@@ -281,7 +333,74 @@ class GeoIpRedis
 
         fclose($handle);
 
-        return [$count, $skippedIpv6, $skippedEmpty, $skippedInvalid];
+        $rowsCountV6 = count($rowsV6);
+        $countV6 = $this->storeIpv6($redis, $keyV6, $rowsV6, $batchSize);
+
+        return [$count, $countV6, $rowsCountV6, $skippedIpv6, $skippedEmpty, $skippedInvalid];
+    }
+
+    /**
+     * Sort IPv6 ranges, merge contiguous ranges of the same country, ZADD in batches.
+     *
+     * Score = 0, member = "end_hex:start_hex:CC": lexicographic order of fixed-width hex
+     * equals numeric order, so ZRANGEBYLEX finds the first range with end >= ip.
+     * Merging is lossless for lookups (the union of adjacent same-country ranges answers
+     * identically) and shrinks the set ~3x on the iplocate data.
+     *
+     * @param array<int, string> $rows packed "start(16 bytes) end(16 bytes) country_code"
+     *
+     * @return int number of stored ranges
+     */
+    protected function storeIpv6(PhpRedis $redis, string $key, array &$rows, int $batchSize): int
+    {
+        if ($rows === []) {
+            return 0;
+        }
+
+        sort($rows, SORT_STRING);
+
+        $stored = 0;
+        $args = [];
+        $curStart = $curEnd = $curCc = null;
+
+        $emit = function () use (&$args, &$stored, $redis, $key, $batchSize, &$curStart, &$curEnd, &$curCc): void {
+            $args[] = 0;
+            $args[] = bin2hex($curEnd) . ':' . bin2hex($curStart) . ':' . $curCc;
+            $stored++;
+
+            if (count($args) >= $batchSize * 2) {
+                $redis->zAdd($key, ...$args);
+                $args = [];
+            }
+        };
+
+        foreach ($rows as $row) {
+            $start = substr($row, 0, 16);
+            $end = substr($row, 16, 16);
+            $cc = substr($row, 32);
+
+            if ($curStart !== null && $cc === $curCc && $start === CidrConverter::incrementBinary($curEnd)) {
+                $curEnd = $end;
+
+                continue;
+            }
+
+            if ($curStart !== null) {
+                $emit();
+            }
+
+            [$curStart, $curEnd, $curCc] = [$start, $end, $cc];
+        }
+
+        $emit();
+
+        if ($args !== []) {
+            $redis->zAdd($key, ...$args);
+        }
+
+        $rows = [];
+
+        return $stored;
     }
 
     /**
