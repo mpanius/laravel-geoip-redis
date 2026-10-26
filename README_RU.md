@@ -159,6 +159,10 @@ use Mpanius\GeoIpRedis\Facades\GeoIpRedis;
 GeoIpRedis::lookup('8.8.8.8');     // "US"
 GeoIpRedis::lookup('77.88.55.77'); // "RU"
 GeoIpRedis::lookup('invalid');     // null
+
+// IPv6 (данные грузятся при GEOIP_IPV6_ENABLED=true, см. «IPv6»)
+GeoIpRedis::lookup('2a02:6b8::1');           // "RU"
+GeoIpRedis::lookup('::ffff:8.8.8.8');        // "US" — IPv4-mapped разрешается как IPv4 (работает и без IPv6-данных)
 ```
 
 Через DI:
@@ -194,20 +198,51 @@ CSV (iplocate.io)
 
 ### Структура данных в Redis
 
-**Sorted Set** (`geoip:v4`):
+**IPv4 — Sorted Set** (`geoip:v4`):
 - **Score**: `end_ip` (unsigned 32-bit integer из CIDR)
 - **Member**: `"CC:start_ip"` (например `"RU:3232235520"`)
+
+**IPv6 — Sorted Set** (`geoip:v6`, только при `GEOIP_IPV6_ENABLED=true`):
+- **Score**: `0` у всех members
+- **Member**: `"<end_hex32>:<start_hex32>:CC"` — 128-битные адреса как 32 hex-символа в нижнем регистре (например `"20010db8ffffffffffffffffffffffff:20010db8000000000000000000000000:DE"`)
 
 ### Алгоритм lookup (выполняется целиком в Redis)
 
 ```lua
+-- IPv4
 ZRANGEBYSCORE geoip:v4 <ip_integer> +inf LIMIT 0 1
+-- IPv6
+ZRANGEBYLEX   geoip:v6 [<ip_hex32> + LIMIT 0 1
 -- → находит первый диапазон где end_ip >= query_ip
 -- → проверяет start_ip <= query_ip
 -- → возвращает код страны или false
 ```
 
-Сложность: **O(log N)** на один lookup.
+Сложность: **O(log N)** на один lookup для обоих семейств.
+
+### IPv6
+
+Score в Sorted Set — double (53 бита точности для целых), 128-битный адрес в него без потерь не влезает. Поэтому у всех members score `0`, а порядок задаёт сама строка member (лексикографически). Hex фиксированной ширины в нижнем регистре сортируется ровно как число, поэтому при `end` в начале member `ZRANGEBYLEX key [<ip> + LIMIT 0 1` возвращает первый диапазон с `end >= ip` — как `ZRANGEBYSCORE` для IPv4. Затем Lua проверяет `start <= ip` (сравнение кусками по 8 hex-символов, не зависит от локали сервера). Схема точна для любых префиксов /0../128, не требует расширений (GMP/bcmath) и имеет ту же сложность O(log N).
+
+- Lua-функция сохранила имя и сигнатуру (`FCALL_RO geoip_country 1 <key> <arg>`): аргумент из 32 hex-символов — IPv6-запрос в `KEYS[1]`, десятичный — IPv4. Ключ выбирает PHP.
+- **IPv4-mapped** (`::ffff:a.b.c.d`) в PHP превращается в IPv4 и ищется в IPv4-ключе, поэтому работает даже при выключенном IPv6. Zone ID (`fe80::1%eth0`) отбрасывается.
+- При загрузке смежные диапазоны одной страны **склеиваются** (результат lookup не меняется). На CSV iplocate от 2026-10-26: 1 368 672 IPv6-строк -> 471 973 диапазона.
+- IPv4 и IPv6 подменяются независимо и атомарно (`geoip:v6:loading` -> `RENAME`). Если в новом CSV нет IPv6-строк, прежний `geoip:v6` не трогается.
+- Lookup IPv6-адреса всегда идёт в `geoip:v6`, независимо от `ipv6_enabled` (флаг управляет только загрузкой): нет данных — `null`.
+
+**Включение**: `GEOIP_IPV6_ENABLED=true` на узле, где идёт `geoip:update`, затем `php artisan geoip:update --register-function` (загрузит новую версию Lua; старая безопасно вернёт `null` для IPv6 и продолжит обслуживать IPv4) и `php artisan geoip:update --force`.
+
+**Стоимость** (CSV iplocate 2026-10-26, Redis 7.4, `MEMORY USAGE`; 787 197 IPv4-строк, 1 368 672 IPv6-строк):
+
+| | Записей | Память Redis | Время загрузки |
+|---|---|---|---|
+| `geoip:v4` | 787 197 | ~71–74 MB | ~3.7 с |
+| `geoip:v6` (со склейкой) | 471 973 | ~72 MB | ещё ~7 с |
+| `geoip:v6` (без склейки, для справки) | 1 368 672 | ~222 MB | — |
+
+Закладывайте: **+~72 MB памяти Redis**, в момент подмены — **до 2x от всего набора** (старый и новый ключи живут вместе до `RENAME`; `maxmemory` должен это выдержать) и **~210 MB памяти PHP** в процессе `geoip:update` (IPv6-строки сортируются в памяти для склейки; задайте `memory_limit`, например `php -d memory_limit=512M artisan geoip:update`). На чтение это не влияет: серверный `FCALL_RO` занимает ~0,05 мс для обоих семейств (redis-benchmark, 1 клиент, localhost; прежняя IPv4-функция в пределах шума так же).
+
+**Требования**: Redis 7+ / Valkey 7+ (Functions, `FCALL_RO`; `ZRANGEBYLEX ... LIMIT` есть с 2.8.9), соединение с `serializer=NONE` и `compression=NONE`, как и раньше.
 
 ### Почему FCALL_RO, а не EVAL/EVALSHA
 
@@ -220,7 +255,7 @@ ZRANGEBYSCORE geoip:v4 <ip_integer> +inf LIMIT 0 1
 
 ### Zero-downtime обновление
 
-Данные загружаются во временный ключ (`geoip:v4:loading`), затем атомарно подменяются через `RENAME`. Lookup никогда не видит частично загруженные данные.
+Данные загружаются во временный ключ (`geoip:v4:loading`, для IPv6 — `geoip:v6:loading`), затем атомарно подменяются через `RENAME`. Lookup никогда не видит частично загруженные данные.
 
 ## Источник данных
 
@@ -229,6 +264,7 @@ ZRANGEBYSCORE geoip:v4 <ip_integer> +inf LIMIT 0 1
 - Обновляется ежедневно
 - Лицензия: CC BY-SA 4.0
 - Формат: `network,country,country_code,continent_code`
+- IPv4 и IPv6 в одном файле (2026-10-26: 787 197 IPv4 + 1 368 672 IPv6 строк)
 
 ## Trusted Proxies
 
@@ -270,7 +306,7 @@ ZRANGEBYSCORE geoip:v4 <ip_integer> +inf LIMIT 0 1
       ?: 'US';
   ```
 - **Read replicas**: Lua function зарегистрирована с `flags = {'no-writes'}`, поэтому lookup через `FCALL_RO` работает на Redis read replicas — идеально для масштабирования чтения.
-- **Мониторинг памяти**: Проверяйте использование памяти Redis командой `geoip:update --status`. Данные только по IPv4 обычно занимают 50–100 MB.
+- **Мониторинг памяти**: Проверяйте использование памяти Redis командой `geoip:update --status`. Данные только по IPv4 обычно занимают 50–100 MB; IPv6 добавляет ~70 MB.
 - **Проверка после деплоя**: После деплоя на новый сервер выполните `geoip:update --register-function`, чтобы убедиться что Lua function загружена (она сохраняется в RDB/AOF, но свежий экземпляр Redis её не содержит).
 
 ## Лицензия

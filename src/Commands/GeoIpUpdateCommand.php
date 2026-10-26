@@ -50,6 +50,9 @@ class GeoIpUpdateCommand extends Command
 
         $this->info("Loaded {$result->entriesCount} IPv4 entries in {$result->duration}s");
 
+        if ($result->ipv6EntriesCount > 0) {
+            $this->info("Loaded {$result->ipv6EntriesCount} IPv6 ranges (merged from {$result->ipv6RowsCount} CSV rows)");
+        }
         if ($result->skippedIpv6 > 0) {
             $this->comment("  Skipped {$result->skippedIpv6} IPv6 entries (ipv6_enabled=false)");
         }
@@ -72,6 +75,7 @@ class GeoIpUpdateCommand extends Command
             : 'never';
 
         $memoryMb = round($status['memory_bytes'] / 1024 / 1024, 2);
+        $memoryMbV6 = round($status['ipv6_memory_bytes'] / 1024 / 1024, 2);
 
         $this->table(
             ['Parameter', 'Value'],
@@ -79,14 +83,18 @@ class GeoIpUpdateCommand extends Command
                 ['Last update', $updatedAt],
                 ['IPv4 entries (loaded)', number_format($status['entries_count'])],
                 ['Sorted set cardinality', number_format($status['sorted_set_card'])],
+                ['IPv6 entries (loaded)', number_format($status['ipv6_entries_count'])],
+                ['IPv6 sorted set cardinality', number_format($status['ipv6_sorted_set_card'])],
                 ['Skipped: IPv6', number_format($status['skipped_ipv6'])],
                 ['Skipped: empty country', number_format($status['skipped_empty'])],
                 ['Skipped: invalid', number_format($status['skipped_invalid'])],
-                ['Memory usage', "{$memoryMb} MB"],
+                ['Memory usage (IPv4)', "{$memoryMb} MB"],
+                ['Memory usage (IPv6)', "{$memoryMbV6} MB"],
                 ['Source', $status['source'] ?? 'N/A'],
                 ['Needs update', $service->needsUpdate() ? 'YES' : 'no'],
                 ['Connection', config('geoip-redis.connection')],
                 ['Redis key', config('geoip-redis.key')],
+                ['Redis key (IPv6)', config('geoip-redis.key_v6')],
             ],
         );
 
